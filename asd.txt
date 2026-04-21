@@ -1,83 +1,85 @@
-// Step 1: Build a device lookup from entries that DO have device info
-let deviceLookup = SigninLogs
+// Normalize interactive sign-ins (DeviceDetail is dynamic)
+let interactive = SigninLogs
     | where TimeGenerated > ago(30d)
     | where ResultType == 0
-    | extend deviceId = tostring(DeviceDetail.deviceId)
-    | where isnotempty(deviceId)
-    | extend isManaged = tostring(DeviceDetail.isManaged)
-    | extend isCompliant = tostring(DeviceDetail.isCompliant)
-    | extend trustType = tostring(DeviceDetail.trustType)
+    | extend 
+        deviceId    = tostring(DeviceDetail.deviceId),
+        isManaged   = tostring(DeviceDetail.isManaged),
+        isCompliant = tostring(DeviceDetail.isCompliant),
+        deviceOS    = tostring(DeviceDetail.operatingSystem),
+        SignInType   = "Interactive",
+        origRequestId = tostring(OriginalRequestId)
+    | project TimeGenerated, UserPrincipalName, AppDisplayName, 
+              IPAddress, deviceId, isManaged, isCompliant, 
+              deviceOS, SignInType, RequestId, origRequestId;
+//
+// Normalize non-interactive sign-ins (DeviceDetail is string — parse it)
+let nonInteractive = AADNonInteractiveUserSignInLogs
+    | where TimeGenerated > ago(30d)
+    | where ResultType == 0
+    | extend parsedDevice = todynamic(tostring(DeviceDetail))
+    | extend 
+        deviceId    = tostring(parsedDevice.deviceId),
+        isManaged   = tostring(parsedDevice.isManaged),
+        isCompliant = tostring(parsedDevice.isCompliant),
+        deviceOS    = tostring(parsedDevice.operatingSystem),
+        SignInType   = "NonInteractive",
+        origRequestId = tostring(OriginalRequestId)
+    | project TimeGenerated, UserPrincipalName, AppDisplayName, 
+              IPAddress, deviceId, isManaged, isCompliant, 
+              deviceOS, SignInType, RequestId, origRequestId;
+//
+// Build device lookup from entries that have device info
+let deviceLookup = union interactive, nonInteractive
+    | where isnotempty(deviceId) and deviceId != ""
     | project RequestId, UserPrincipalName, deviceId, 
-              isManaged, isCompliant, trustType, IPAddress;
+              isManaged, isCompliant, IPAddress, TimeGenerated;
 //
-// Step 2: Get all sign-ins with missing device info
-let missingDevice = union SigninLogs, AADNonInteractiveUserSignInLogs
-    | where TimeGenerated > ago(30d)
-    | where ResultType == 0
-    | extend deviceId = tostring(DeviceDetail.deviceId)
-    | where isempty(deviceId)
-    | extend origRequestId = tostring(OriginalRequestId)
-    | extend corrId = tostring(CorrelationId);
+// All entries with missing device info
+let missingDevice = union interactive, nonInteractive
+    | where isempty(deviceId) or deviceId == "";
 //
-// Step 3: Join back on OriginalRequestId -> RequestId
-//         This links silent refreshes to the interactive sign-in
-//         that started the session
-let enrichedViaOrigRequest = missingDevice
+// Layer 1: Resolve via OriginalRequestId
+let resolvedLayer1 = missingDevice
     | where isnotempty(origRequestId)
     | join kind=leftouter (
-        deviceLookup | project-rename origRequestId = RequestId
-    ) on origRequestId, UserPrincipalName
-    | extend ResolvedVia = iff(isnotempty(deviceId1), "OriginalRequestId", "");
-//
-// Step 4: For entries still unresolved, try CorrelationId
-let stillMissing = enrichedViaOrigRequest
-    | where isempty(ResolvedVia);
-let enrichedViaCorrelation = stillMissing
-    | join kind=leftouter (
         deviceLookup 
-        | join kind=inner (
-            SigninLogs 
-            | project RequestId, CorrelationId
-        ) on RequestId
-        | project-rename corrId = CorrelationId
-    ) on corrId, UserPrincipalName
-    | extend ResolvedVia = iff(isnotempty(deviceId1), "CorrelationId", "");
+        | project-rename origRequestId = RequestId, 
+                         resolvedDeviceId = deviceId,
+                         resolvedManaged = isManaged
+    ) on origRequestId, UserPrincipalName
+    | extend Resolved = isnotempty(resolvedDeviceId);
 //
-// Step 5: For entries STILL unresolved, fall back to 
-//         same user + same IP within a short time window.
-//         If user X signed in from IP Y with a managed device 
-//         at 10:00, and there's a deviceless entry from user X 
-//         at IP Y at 10:02, it's almost certainly the same device.
-let stillMissing2 = enrichedViaCorrelation
-    | where isempty(ResolvedVia);
-let enrichedViaIPWindow = stillMissing2
+// Layer 2: IP + time window for anything still unresolved
+let unresolvedAfterL1 = resolvedLayer1 
+    | where not(Resolved)
+    | project-away resolvedDeviceId, resolvedManaged, Resolved;
+let resolvedLayer2 = unresolvedAfterL1
     | join kind=leftouter (
         deviceLookup
-        | join kind=inner (
-            SigninLogs 
-            | project RequestId, TimeGenerated
-        ) on RequestId
-        | project UserPrincipalName, IPAddress, deviceId, 
-                  isManaged, isCompliant, trustType, 
+        | project UserPrincipalName, IPAddress, 
+                  resolvedDeviceId = deviceId, 
+                  resolvedManaged = isManaged, 
                   ManagedTime = TimeGenerated
     ) on UserPrincipalName, IPAddress
     | where abs(datetime_diff('minute', TimeGenerated, ManagedTime)) < 30
-    | extend ResolvedVia = iff(isnotempty(deviceId1), "IP+TimeWindow", "");
+    | extend Resolved = isnotempty(resolvedDeviceId)
+    | summarize arg_max(Resolved, *) by TimeGenerated, UserPrincipalName, 
+                RequestId;
 //
-// Step 6: Summarize what's left truly unresolved
-let resolved = union 
-    (enrichedViaOrigRequest | where isnotempty(ResolvedVia)),
-    (enrichedViaCorrelation | where isnotempty(ResolvedVia)),
-    (enrichedViaIPWindow | where isnotempty(ResolvedVia));
-let trulyUnresolved = enrichedViaIPWindow
-    | where isempty(ResolvedVia);
+// Combine: truly unresolved = not caught by either layer
+let trulyUnresolved = resolvedLayer2
+    | where not(Resolved);
 //
-// Final output: Only the genuinely unresolved entries
+// Final output
 trulyUnresolved
 | summarize 
-    UnresolvedCount = count(),
-    Apps = make_set(AppDisplayName),
-    IPs = make_set(IPAddress),
-    LastSeen = max(TimeGenerated)
+    FirstSeen       = min(TimeGenerated),
+    LastSeen        = max(TimeGenerated),
+    OSTypes         = make_set(deviceOS),
+    IPs             = make_set(IPAddress, 25),
+    SignInCount     = count(),
+    Apps            = make_set(AppDisplayName)
   by UserPrincipalName
-| order by UnresolvedCount desc
+| extend OSTypes = set_difference(OSTypes, dynamic([""]))  // remove blanks
+| order by SignInCount desc
