@@ -1,0 +1,83 @@
+// Step 1: Build a device lookup from entries that DO have device info
+let deviceLookup = SigninLogs
+    | where TimeGenerated > ago(30d)
+    | where ResultType == 0
+    | extend deviceId = tostring(DeviceDetail.deviceId)
+    | where isnotempty(deviceId)
+    | extend isManaged = tostring(DeviceDetail.isManaged)
+    | extend isCompliant = tostring(DeviceDetail.isCompliant)
+    | extend trustType = tostring(DeviceDetail.trustType)
+    | project RequestId, UserPrincipalName, deviceId, 
+              isManaged, isCompliant, trustType, IPAddress;
+//
+// Step 2: Get all sign-ins with missing device info
+let missingDevice = union SigninLogs, AADNonInteractiveUserSignInLogs
+    | where TimeGenerated > ago(30d)
+    | where ResultType == 0
+    | extend deviceId = tostring(DeviceDetail.deviceId)
+    | where isempty(deviceId)
+    | extend origRequestId = tostring(OriginalRequestId)
+    | extend corrId = tostring(CorrelationId);
+//
+// Step 3: Join back on OriginalRequestId -> RequestId
+//         This links silent refreshes to the interactive sign-in
+//         that started the session
+let enrichedViaOrigRequest = missingDevice
+    | where isnotempty(origRequestId)
+    | join kind=leftouter (
+        deviceLookup | project-rename origRequestId = RequestId
+    ) on origRequestId, UserPrincipalName
+    | extend ResolvedVia = iff(isnotempty(deviceId1), "OriginalRequestId", "");
+//
+// Step 4: For entries still unresolved, try CorrelationId
+let stillMissing = enrichedViaOrigRequest
+    | where isempty(ResolvedVia);
+let enrichedViaCorrelation = stillMissing
+    | join kind=leftouter (
+        deviceLookup 
+        | join kind=inner (
+            SigninLogs 
+            | project RequestId, CorrelationId
+        ) on RequestId
+        | project-rename corrId = CorrelationId
+    ) on corrId, UserPrincipalName
+    | extend ResolvedVia = iff(isnotempty(deviceId1), "CorrelationId", "");
+//
+// Step 5: For entries STILL unresolved, fall back to 
+//         same user + same IP within a short time window.
+//         If user X signed in from IP Y with a managed device 
+//         at 10:00, and there's a deviceless entry from user X 
+//         at IP Y at 10:02, it's almost certainly the same device.
+let stillMissing2 = enrichedViaCorrelation
+    | where isempty(ResolvedVia);
+let enrichedViaIPWindow = stillMissing2
+    | join kind=leftouter (
+        deviceLookup
+        | join kind=inner (
+            SigninLogs 
+            | project RequestId, TimeGenerated
+        ) on RequestId
+        | project UserPrincipalName, IPAddress, deviceId, 
+                  isManaged, isCompliant, trustType, 
+                  ManagedTime = TimeGenerated
+    ) on UserPrincipalName, IPAddress
+    | where abs(datetime_diff('minute', TimeGenerated, ManagedTime)) < 30
+    | extend ResolvedVia = iff(isnotempty(deviceId1), "IP+TimeWindow", "");
+//
+// Step 6: Summarize what's left truly unresolved
+let resolved = union 
+    (enrichedViaOrigRequest | where isnotempty(ResolvedVia)),
+    (enrichedViaCorrelation | where isnotempty(ResolvedVia)),
+    (enrichedViaIPWindow | where isnotempty(ResolvedVia));
+let trulyUnresolved = enrichedViaIPWindow
+    | where isempty(ResolvedVia);
+//
+// Final output: Only the genuinely unresolved entries
+trulyUnresolved
+| summarize 
+    UnresolvedCount = count(),
+    Apps = make_set(AppDisplayName),
+    IPs = make_set(IPAddress),
+    LastSeen = max(TimeGenerated)
+  by UserPrincipalName
+| order by UnresolvedCount desc
