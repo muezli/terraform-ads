@@ -2,77 +2,40 @@ let interactive = SigninLogs
     | where TimeGenerated > ago(30d)
     | where ResultType == 0
     | extend 
-        deviceId    = tostring(DeviceDetail.deviceId),
-        isManaged   = tostring(DeviceDetail.isManaged),
-        isCompliant = tostring(DeviceDetail.isCompliant),
-        deviceOS    = tostring(DeviceDetail.operatingSystem),
-        SignInType   = "Interactive",
-        origRequestId = tostring(OriginalRequestId)
-    | project TimeGenerated, UserPrincipalName, AppDisplayName, 
-              IPAddress, deviceId, isManaged, isCompliant, 
-              deviceOS, SignInType, Id, origRequestId;
+        deviceId  = tostring(DeviceDetail.deviceId),
+        isManaged = tostring(DeviceDetail.isManaged),
+        deviceOS  = tostring(DeviceDetail.operatingSystem)
+    | project TimeGenerated, UserPrincipalName, AppDisplayName,
+              IPAddress, deviceId, isManaged, deviceOS;
 //
 let nonInteractive = AADNonInteractiveUserSignInLogs
     | where TimeGenerated > ago(30d)
     | where ResultType == 0
     | extend parsedDevice = todynamic(tostring(DeviceDetail))
     | extend 
-        deviceId    = tostring(parsedDevice.deviceId),
-        isManaged   = tostring(parsedDevice.isManaged),
-        isCompliant = tostring(parsedDevice.isCompliant),
-        deviceOS    = tostring(parsedDevice.operatingSystem),
-        SignInType   = "NonInteractive",
-        origRequestId = tostring(OriginalRequestId)
-    | project TimeGenerated, UserPrincipalName, AppDisplayName, 
-              IPAddress, deviceId, isManaged, isCompliant, 
-              deviceOS, SignInType, Id, origRequestId;
+        deviceId  = tostring(parsedDevice.deviceId),
+        isManaged = tostring(parsedDevice.isManaged),
+        deviceOS  = tostring(parsedDevice.operatingSystem)
+    | project TimeGenerated, UserPrincipalName, AppDisplayName,
+              IPAddress, deviceId, isManaged, deviceOS;
 //
-let deviceLookup = union interactive, nonInteractive
-    | where isnotempty(deviceId) and deviceId != ""
-    | project Id, UserPrincipalName, deviceId, 
-              isManaged, isCompliant, IPAddress, TimeGenerated;
-//
-let missingDevice = union interactive, nonInteractive
-    | where isempty(deviceId) or deviceId == "";
-//
-// Layer 1: Resolve via OriginalRequestId -> Id of the original sign-in
-let resolvedLayer1 = missingDevice
-    | where isnotempty(origRequestId)
-    | join kind=leftouter (
-        deviceLookup 
-        | project-rename origRequestId = Id, 
-                         resolvedDeviceId = deviceId,
-                         resolvedManaged = isManaged
-    ) on origRequestId, UserPrincipalName
-    | extend Resolved = isnotempty(resolvedDeviceId);
-//
-// Layer 2: IP + time window for still unresolved
-let unresolvedAfterL1 = resolvedLayer1 
-    | where not(Resolved)
-    | project-away resolvedDeviceId, resolvedManaged, Resolved;
-let resolvedLayer2 = unresolvedAfterL1
-    | join kind=leftouter (
-        deviceLookup
-        | project UserPrincipalName, IPAddress, 
-                  resolvedDeviceId = deviceId, 
-                  resolvedManaged = isManaged, 
-                  ManagedTime = TimeGenerated
-    ) on UserPrincipalName, IPAddress
-    | where abs(datetime_diff('minute', TimeGenerated, ManagedTime)) < 30
-    | extend Resolved = isnotempty(resolvedDeviceId)
-    | summarize arg_max(Resolved, *) by TimeGenerated, UserPrincipalName, Id;
-//
-let trulyUnresolved = resolvedLayer2
-    | where not(Resolved);
-//
-trulyUnresolved
+union interactive, nonInteractive
+| extend IsUnmanaged = isempty(deviceId) or deviceId == "" or isManaged != "true"
 | summarize 
-    FirstSeen       = min(TimeGenerated),
-    LastSeen        = max(TimeGenerated),
-    OSTypes         = make_set(deviceOS),
-    IPs             = make_set(IPAddress, 25),
-    SignInCount     = count(),
-    Apps            = make_set(AppDisplayName)
+    TotalSignIns     = count(),
+    UnmanagedSignIns = countif(IsUnmanaged),
+    ManagedSignIns   = countif(not(IsUnmanaged)),
+    FirstSeen        = min(TimeGenerated),
+    LastSeen         = max(TimeGenerated),
+    OSTypes          = make_set(deviceOS, 10),
+    IPs              = make_set(iff(IsUnmanaged, IPAddress, ""), 25),
+    Apps             = make_set(iff(IsUnmanaged, AppDisplayName, ""), 25)
   by UserPrincipalName
+| where UnmanagedSignIns > 0
 | extend OSTypes = set_difference(OSTypes, dynamic([""]))
-| order by SignInCount desc
+| extend IPs = set_difference(IPs, dynamic([""]))
+| extend Apps = set_difference(Apps, dynamic([""]))
+| extend UnmanagedPct = round(100.0 * UnmanagedSignIns / TotalSignIns, 1)
+| project UserPrincipalName, UnmanagedPct, ManagedSignIns, UnmanagedSignIns,
+          FirstSeen, LastSeen, OSTypes, IPs, Apps
+| order by UnmanagedPct desc, UnmanagedSignIns desc
