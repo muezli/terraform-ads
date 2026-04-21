@@ -1,4 +1,3 @@
-// Normalize interactive sign-ins (DeviceDetail is dynamic)
 let interactive = SigninLogs
     | where TimeGenerated > ago(30d)
     | where ResultType == 0
@@ -11,9 +10,8 @@ let interactive = SigninLogs
         origRequestId = tostring(OriginalRequestId)
     | project TimeGenerated, UserPrincipalName, AppDisplayName, 
               IPAddress, deviceId, isManaged, isCompliant, 
-              deviceOS, SignInType, RequestId, origRequestId;
+              deviceOS, SignInType, Id, origRequestId;
 //
-// Normalize non-interactive sign-ins (DeviceDetail is string — parse it)
 let nonInteractive = AADNonInteractiveUserSignInLogs
     | where TimeGenerated > ago(30d)
     | where ResultType == 0
@@ -27,30 +25,28 @@ let nonInteractive = AADNonInteractiveUserSignInLogs
         origRequestId = tostring(OriginalRequestId)
     | project TimeGenerated, UserPrincipalName, AppDisplayName, 
               IPAddress, deviceId, isManaged, isCompliant, 
-              deviceOS, SignInType, RequestId, origRequestId;
+              deviceOS, SignInType, Id, origRequestId;
 //
-// Build device lookup from entries that have device info
 let deviceLookup = union interactive, nonInteractive
     | where isnotempty(deviceId) and deviceId != ""
-    | project RequestId, UserPrincipalName, deviceId, 
+    | project Id, UserPrincipalName, deviceId, 
               isManaged, isCompliant, IPAddress, TimeGenerated;
 //
-// All entries with missing device info
 let missingDevice = union interactive, nonInteractive
     | where isempty(deviceId) or deviceId == "";
 //
-// Layer 1: Resolve via OriginalRequestId
+// Layer 1: Resolve via OriginalRequestId -> Id of the original sign-in
 let resolvedLayer1 = missingDevice
     | where isnotempty(origRequestId)
     | join kind=leftouter (
         deviceLookup 
-        | project-rename origRequestId = RequestId, 
+        | project-rename origRequestId = Id, 
                          resolvedDeviceId = deviceId,
                          resolvedManaged = isManaged
     ) on origRequestId, UserPrincipalName
     | extend Resolved = isnotempty(resolvedDeviceId);
 //
-// Layer 2: IP + time window for anything still unresolved
+// Layer 2: IP + time window for still unresolved
 let unresolvedAfterL1 = resolvedLayer1 
     | where not(Resolved)
     | project-away resolvedDeviceId, resolvedManaged, Resolved;
@@ -64,14 +60,11 @@ let resolvedLayer2 = unresolvedAfterL1
     ) on UserPrincipalName, IPAddress
     | where abs(datetime_diff('minute', TimeGenerated, ManagedTime)) < 30
     | extend Resolved = isnotempty(resolvedDeviceId)
-    | summarize arg_max(Resolved, *) by TimeGenerated, UserPrincipalName, 
-                RequestId;
+    | summarize arg_max(Resolved, *) by TimeGenerated, UserPrincipalName, Id;
 //
-// Combine: truly unresolved = not caught by either layer
 let trulyUnresolved = resolvedLayer2
     | where not(Resolved);
 //
-// Final output
 trulyUnresolved
 | summarize 
     FirstSeen       = min(TimeGenerated),
@@ -81,5 +74,5 @@ trulyUnresolved
     SignInCount     = count(),
     Apps            = make_set(AppDisplayName)
   by UserPrincipalName
-| extend OSTypes = set_difference(OSTypes, dynamic([""]))  // remove blanks
+| extend OSTypes = set_difference(OSTypes, dynamic([""]))
 | order by SignInCount desc
